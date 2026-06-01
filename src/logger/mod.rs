@@ -19,7 +19,11 @@ pub fn init_logging() -> Result<()> {
         .with_file(true)
         .with_line_number(true)
         .compact()
+        .with_writer(|| std::io::stderr())
         .init();
+
+    // Quick flush test — this line forces any buffered writer to flush
+    tracing::info!("Logger initialized (flush test)");
 
     Ok(())
 }

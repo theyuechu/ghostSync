@@ -194,11 +194,11 @@ pub struct TaskConfig {
 }
 
 const fn default_chunk_size() -> u64 {
-    5000
+    20000
 }
 
 const fn default_batch_size() -> u64 {
-    1000
+    5000
 }
 
 const fn default_max_workers() -> usize {

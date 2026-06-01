@@ -65,6 +65,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Register SQLx AnyPool drivers (MySQL, PostgreSQL, SQLite)
+    // Must be called before any database connection is established.
+    sqlx::any::install_default_drivers();
+
     logger::init_logging()?;
 
     let cli = Cli::parse();
@@ -119,13 +123,19 @@ async fn cmd_run(config_path: &PathBuf, task_name: Option<&str>, dry_run: bool) 
         let target_cfg = cfg.targets.iter().find(|t| t.name == task.target)
             .ok_or_else(|| anyhow::anyhow!("Target '{}' not found in config", task.target))?;
 
+        // Resolve connection URLs with correct database type
+        let mut source_conn = source_cfg.connection.clone();
+        let mut target_conn = target_cfg.connection.clone();
+        source_conn.resolve_with_kind(&source_cfg.db_kind)?;
+        target_conn.resolve_with_kind(&target_cfg.db_kind)?;
+
         if !dry_run {
             match engine::run_task(
                 std::sync::Arc::new(task.clone()),
                 &source_cfg.db_kind,
-                &source_cfg.connection,
+                &source_conn,
                 &target_cfg.db_kind,
-                &target_cfg.connection,
+                &target_conn,
             )
             .await
             {
@@ -148,6 +158,7 @@ async fn cmd_run(config_path: &PathBuf, task_name: Option<&str>, dry_run: bool) 
                 }
                 Err(e) => {
                     tracing::error!("❌ Task '{}' error: {:?}", task.name, e);
+                    eprintln!("❌ Task '{}' error: {:?}", task.name, e);
                 }
             }
         } else {

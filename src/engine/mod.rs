@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result};
 use sqlx::any::AnyRow;
-use sqlx::{AnyPool, Row};
+use sqlx::{Executor, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -89,7 +89,7 @@ pub async fn run_task(
         );
 
         // ── Introspect source table schema ────────────────────────
-        let schema = introspect_table(&source_pool, &table_cfg.name)
+        let schema = introspect_table(&source_pool, &table_cfg.name, source_kind)
             .await
             .with_context(|| format!("Failed to introspect table '{}'", table_cfg.name))?;
 
@@ -102,7 +102,8 @@ pub async fn run_task(
         let col_names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
 
         // ── Build queries ─────────────────────────────────────────
-        let select_sql = build_select_sql(source_kind, &table_cfg.name, &col_names);
+        let pk_column = schema.primary_keys.first().map(|s| s.as_str());
+        let (select_sql, use_keyset) = build_select_sql(source_kind, &table_cfg.name, &col_names, pk_column);
         let insert_sql = build_insert_sql(target_kind, &table_cfg.name, &col_names);
 
         // Optionally truncate target before syncing
@@ -115,28 +116,75 @@ pub async fn run_task(
                 .with_context(|| format!("Failed to truncate target table '{}'", table_cfg.name))?;
         }
 
+        // ── MySQL session optimizations ──
+        if *target_kind == DbKind::MySql {
+            let opts = [
+                "SET SESSION unique_checks = 0",
+                "SET SESSION foreign_key_checks = 0",
+            ];
+            for opt in &opts {
+                sqlx::query(opt).execute(&target_pool).await?;
+            }
+            tracing::info!("  MySQL session: unique_checks=0, foreign_key_checks=0");
+        }
+
         // ── Chunked read loop ─────────────────────────────────────
         let chunk_size: i64 = task.chunk_size.max(100).min(100_000) as i64;
         let batch_size: usize = task.batch_size.max(1).min(10_000) as usize;
-        let mut offset: i64 = 0;
+        let mut cursor: i64 = 0; // used as keyset cursor (pk > cursor) or offset
         let mut table_total: u64 = 0;
 
         loop {
-            let raw_rows: Vec<AnyRow> = sqlx::query(&select_sql)
-                .bind(chunk_size)
-                .bind(offset)
-                .fetch_all(&source_pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to read chunk at offset {} from '{}'",
-                        offset, table_cfg.name
-                    )
-                })?;
+            let raw_rows: Vec<AnyRow> = if use_keyset {
+                sqlx::query(&select_sql)
+                    .bind(cursor)
+                    .bind(chunk_size)
+                    .fetch_all(&source_pool)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to read chunk (keyset, cursor={}) from '{}'",
+                            cursor, table_cfg.name
+                        )
+                    })?
+            } else {
+                sqlx::query(&select_sql)
+                    .bind(chunk_size)
+                    .bind(cursor)
+                    .fetch_all(&source_pool)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to read chunk (offset, cursor={}) from '{}'",
+                            cursor, table_cfg.name
+                        )
+                    })?
+            };
 
             let chunk_len = raw_rows.len();
             if chunk_len == 0 {
                 break;
+            }
+
+            // Update keyset cursor from the last row's PK value
+            if use_keyset {
+                if let Some(pk_name) = pk_column {
+                    if let Some(last_row) = raw_rows.last() {
+                        let pk_idx = col_names.iter().position(|&c| c == pk_name);
+                        if let Some(idx) = pk_idx {
+                            // PK is uncast (BIGINT) for correct ORDER BY, so try i64 first
+                            if let Ok(Some(pk_val)) = last_row.try_get::<Option<i64>, usize>(idx) {
+                                cursor = pk_val;
+                            } else if let Ok(Some(pk_str)) = last_row.try_get::<Option<String>, usize>(idx) {
+                                if let Ok(pk_val) = pk_str.parse::<i64>() {
+                                    cursor = pk_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                cursor += chunk_size;
             }
 
             // Convert raw rows → HashMap for the rule engine
@@ -146,29 +194,25 @@ pub async fn run_task(
             // Apply de-identification rules
             let processed = rule_engine.process_rows(&table_cfg.name, &rows);
 
-            // Write to target in sub-batches
+            // Write to target in sub-batches within a transaction
+            let mut tx = target_pool.begin().await
+                .with_context(|| format!("Failed to begin transaction for chunk (cursor={})", cursor))?;
             for batch in processed.chunks(batch_size) {
-                write_batch(&target_pool, &insert_sql, target_kind, &col_names, batch)
+                write_batch(&mut *tx, &insert_sql, target_kind, &col_names, batch)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to write batch to '{}' (offset={}, count={})",
-                            table_cfg.name,
-                            offset,
-                            batch.len(),
-                        )
-                    })?;
+                    .with_context(|| format!("Write failed at cursor={}, batch={} rows", cursor, batch.len()))?;
             }
+            tx.commit().await
+                .with_context(|| format!("Commit failed at cursor={}", cursor))?;
 
             table_total += chunk_len as u64;
-            offset += chunk_size;
 
             tracing::debug!(
-                "  Table '{}': chunk of {} rows written (total: {}, offset: {})",
+                "  Table '{}': chunk of {} rows written (total: {}, cursor: {})",
                 table_cfg.name,
                 chunk_len,
                 table_total,
-                offset,
+                cursor,
             );
         }
 
@@ -243,17 +287,55 @@ fn row_to_map(row: &AnyRow) -> HashMap<String, Option<String>> {
 
 /// Build a SELECT query with deterministic column order and LIMIT/OFFSET pagination.
 ///
-/// Example: `SELECT "col1", "col2" FROM "mytable" ORDER BY 1 LIMIT ? OFFSET ?`
-fn build_select_sql(kind: &DbKind, table: &str, columns: &[&str]) -> String {
+/// All columns are cast to text/string to ensure cross-database compatibility
+/// (MySQL Datetime, JSON, etc. types are not supported by sqlx Any driver).
+///
+/// Example (Postgres): `SELECT col1::text, col2::text FROM "mytable" ORDER BY 1 LIMIT ? OFFSET ?`
+/// Example (MySQL):    `SELECT CAST(col1 AS CHAR), CAST(col2 AS CHAR) FROM `mytable` ORDER BY 1 LIMIT ? OFFSET ?`
+fn build_select_sql(kind: &DbKind, table: &str, columns: &[&str], pk_column: Option<&str>) -> (String, bool) {
+    let tbl = quote_table(kind, table);
+
+    // In keyset mode the PK column must NOT be cast (CAST changes sort order
+    // from numeric to lexicographic, which breaks ORDER BY).
     let quoted_cols: Vec<String> = columns
         .iter()
-        .map(|c| quote_ident(kind, c))
+        .map(|c| {
+            let quoted = quote_ident(kind, c);
+            let is_pk = pk_column == Some(c);
+            if is_pk {
+                // Keep PK uncast so ORDER BY works numerically with B-tree
+                // index. `row_to_map` falls back to try_get::<i64> → to_string()
+                // when try_get::<String> fails for this column.
+                quoted.clone()
+            } else {
+                match kind {
+                    DbKind::MySql => format!("CAST({} AS CHAR) AS {}", quoted, quoted),
+                    DbKind::Postgres => format!("{}::text AS {}", quoted, quoted),
+                }
+            }
+        })
         .collect();
-    format!(
-        "SELECT {} FROM {} ORDER BY 1 LIMIT ? OFFSET ?",
-        quoted_cols.join(", "),
-        quote_table(kind, table),
-    )
+
+    let cols = quoted_cols.join(", ");
+
+    if let Some(pk) = pk_column {
+        let quoted_pk = quote_ident(kind, pk);
+        (
+            format!(
+                "SELECT {} FROM {} WHERE {} > ? ORDER BY {} LIMIT ?",
+                cols, tbl, quoted_pk, quoted_pk
+            ),
+            true, // keyset mode
+        )
+    } else {
+        (
+            format!(
+                "SELECT {} FROM {} ORDER BY 1 LIMIT ? OFFSET ?",
+                cols, tbl,
+            ),
+            false, // offset mode
+        )
+    }
 }
 
 /// Build an INSERT statement with single-row placeholders.
@@ -314,13 +396,16 @@ fn quote_table(kind: &DbKind, table: &str) -> String {
 ///
 /// This function extends it with additional value groups for all rows in `batch`
 /// and rebinds the placeholders accordingly.
-async fn write_batch(
-    pool: &AnyPool,
+async fn write_batch<'e, E>(
+    executor: E,
     insert_sql: &str,
     kind: &DbKind,
     col_names: &[&str],
     rows: &[HashMap<String, Option<String>>],
-) -> Result<()> {
+) -> Result<()>
+where
+    E: Executor<'e, Database = sqlx::Any>,
+{
     if rows.is_empty() {
         return Ok(());
     }
@@ -335,7 +420,7 @@ async fn write_batch(
             let val = rows[0].get(*col).and_then(|v| v.clone());
             q = q.bind(val);
         }
-        q.execute(pool).await?;
+        q.execute(executor).await?;
         return Ok(());
     }
 
@@ -379,7 +464,7 @@ async fn write_batch(
         }
     }
 
-    q.execute(pool).await?;
+    q.execute(executor).await?;
     Ok(())
 }
 
@@ -403,20 +488,44 @@ mod tests {
 
     #[test]
     fn test_build_select_sql() {
-        let sql = build_select_sql(&DbKind::Postgres, "users", &["id", "name", "email"]);
+        let (sql, use_keyset) = build_select_sql(&DbKind::Postgres, "users", &["id", "name", "email"], None);
+        assert!(!use_keyset);
         assert_eq!(
             sql,
-            r#"SELECT "id", "name", "email" FROM "users" ORDER BY 1 LIMIT ? OFFSET ?"#
+            r#"SELECT "id"::text AS "id", "name"::text AS "name", "email"::text AS "email" FROM "users" ORDER BY 1 LIMIT ? OFFSET ?"#
         );
     }
 
     #[test]
     fn test_build_select_sql_mysql() {
-        let sql = build_select_sql(&DbKind::MySql, "users", &["id", "name"]);
+        let (sql, use_keyset) = build_select_sql(&DbKind::MySql, "users", &["id", "name"], None);
+        assert!(!use_keyset);
         assert_eq!(
             sql,
-            "SELECT `id`, `name` FROM `users` ORDER BY 1 LIMIT ? OFFSET ?"
+            "SELECT CAST(`id` AS CHAR) AS `id`, CAST(`name` AS CHAR) AS `name` FROM `users` ORDER BY 1 LIMIT ? OFFSET ?"
         );
+    }
+
+    #[test]
+    fn test_build_select_sql_keyset() {
+        let (sql, use_keyset) = build_select_sql(&DbKind::MySql, "users", &["id", "name", "email"], Some("id"));
+        assert!(use_keyset);
+        // PK column is NOT cast (kept as raw BIGINT for numeric ORDER BY)
+        assert!(sql.contains(" `id`"));
+        assert!(!sql.contains("CAST(`id`"));
+        // Non-PK columns are still cast
+        assert!(sql.contains("CAST(`name`"));
+        assert!(sql.contains("CAST(`email`"));
+        assert!(sql.contains("`id` > ?"));
+        assert!(sql.contains("ORDER BY `id`"));
+    }
+
+    #[test]
+    fn test_build_select_sql_keyset_pg() {
+        let (sql, use_keyset) = build_select_sql(&DbKind::Postgres, "users", &["id", "name"], Some("id"));
+        assert!(use_keyset);
+        assert!(!sql.contains("id::text"));
+        assert!(sql.contains(r#""name"::text"#));
     }
 
     #[test]
