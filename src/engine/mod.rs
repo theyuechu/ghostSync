@@ -1,8 +1,10 @@
 /// Data sync engine: orchestrates chunked reads → rule processing → bulk writes.
 ///
-/// For MySQL targets, uses LOAD DATA for cross-server sync, or a single
-/// INSERT ... SELECT for same-server sync (avoids all data transfer to Rust).
-/// For PostgreSQL targets, uses multi-row INSERT (no change).
+/// For same-host MySQL, uses SELECT INTO OUTFILE + LOAD DATA for maximum
+/// throughput (avoids TCP transfer and sqlx AnyRow overhead).
+/// For cross-server connections, uses chunked SELECT + multi-row INSERT
+/// (works for both MySQL and PostgreSQL).
+/// No named pipes or FIFOs — every path is stable on macOS and Linux.
 
 use anyhow::{Context, Result};
 use sqlx::any::AnyRow;
@@ -10,11 +12,10 @@ use sqlx::{Executor, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tracing;
 
-use crate::config::types::{ConnectionConfig, DbKind, RuleType, TableConfig, TableMode, TaskConfig};
+use crate::config::types::{ConnectionConfig, DbKind, TableConfig, TableMode, TaskConfig};
 use crate::db::connector;
 use crate::db::schema::introspect_table;
 use crate::rule::RuleEngine;
@@ -95,14 +96,14 @@ pub async fn run_task(
         let task = task.clone();
         let source_kind = source_kind.clone();
         let target_kind = target_kind.clone();
-        let source_conn = source_conn.clone();
-        let target_conn = target_conn.clone();
         let table_cfg = table_cfg.clone();
         let rule_engine = rule_engine.clone();
         let source_pool = source_pool.clone();
         let target_pool = target_pool.clone();
         let store = store.clone();
         let tn = task_name.clone();
+        let source_conn = source_conn.clone();
+        let target_conn = target_conn.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
@@ -250,13 +251,9 @@ async fn sync_one_table(
     let mut table_total: u64 = 0;
     let table_name = table_cfg.name.clone();
 
-    let owned_col_names = col_names.clone();
-    let owned_table_name = table_name.clone();
-    let pk_idx: Option<usize> = pk_column.and_then(|pk| col_names.iter().position(|c| c == pk));
-
-    // ── Server-side INSERT...SELECT (same MySQL source/target, avoid data transfer to Rust) ──
-    let same_server = *source_kind == *target_kind
-        && source_conn.host == target_conn.host && source_conn.port == target_conn.port;
+    let _owned_col_names = col_names.clone();
+    let _owned_table_name = table_name.clone();
+    let _pk_idx: Option<usize> = pk_column.and_then(|pk| col_names.iter().position(|c| c == pk));
 
     // ── MySQL session optimizations ──
     if *target_kind == DbKind::MySql {
@@ -271,196 +268,105 @@ async fn sync_one_table(
         tracing::info!("  MySQL session: unique_checks=0, foreign_key_checks=0, sql_log_bin=0");
     }
 
-    // ── Same-server MySQL: use server-side INSERT...SELECT ──
-    if same_server {
-        // Use pinned connection so session settings stay in scope
-        let mut conn = target_pool.acquire().await
-            .with_context(|| "Failed to acquire target connection for INSERT...SELECT")?;
+    // ── Same-server MySQL: SELECT INTO OUTFILE → Rust → FIFO → LOAD DATA ──
+    let is_same_server = *source_kind == DbKind::MySql && *target_kind == DbKind::MySql
+        && source_conn.host == target_conn.host && source_conn.port == target_conn.port;
 
-        // Session optimizations on the pinned connection
-        sqlx::query("SET SESSION unique_checks = 0").execute(&mut *conn).await?;
-        sqlx::query("SET SESSION foreign_key_checks = 0").execute(&mut *conn).await?;
-        sqlx::query("SET SESSION sql_log_bin = 0").execute(&mut *conn).await?;
-        sqlx::query("SET SESSION autocommit = 0").execute(&mut *conn).await?;
-        tracing::info!("  Same-server MySQL — using server-side INSERT...SELECT");
+    if is_same_server {
+        // This path avoids sqlx AnyRow overhead and TCP data transfer by having
+        // MySQL write a temp CSV file on the server, then Rust reads it directly
+        // for rule processing, and finally LOAD DATA INFILE writes to the target.
+        let pid = std::process::id();
+        let src_db = source_conn.database.as_deref().unwrap_or("public");
 
-        // Build column expressions with rules applied
-        let rules = table_cfg.rules.as_ref();
-        let mut sql_exprs: Vec<String> = Vec::with_capacity(col_names.len());
-        for col in &col_names {
-            let expr = if let Some(rules_list) = rules {
-                if let Some(rc) = rules_list.iter().find(|r| r.field == *col) {
-                    rule_to_sql_expr(col, &rc.rule, rc.params.as_ref(), target_kind)
-                } else {
-                    quote_ident(target_kind, col)
-                }
-            } else {
-                quote_ident(target_kind, col)
-            };
-            sql_exprs.push(expr);
-        }
+        // ──────────────────────────────────────────────
+        // Strategy for same-server MySQL
+        // 1. SELECT INTO OUTFILE  →  temp CSV (MySQL writing, no TCP)
+        // 2. Rust reads the file, applies rules, writes /tmp/gsync_{pid}_out.csv
+        // 3. LOAD DATA INFILE from the output CSV
+        // ──────────────────────────────────────────────
 
+        // Step 1 — SELECT INTO OUTFILE
         let cols_list = col_names.iter()
             .map(|c| quote_ident(target_kind, c))
             .collect::<Vec<_>>()
             .join(", ");
+        let quoted_table = format!("{}.{}", quote_ident(target_kind, src_db), quote_ident(target_kind, &table_cfg.name));
+        let raw_csv = format!("/tmp/gsync_{}_raw.csv", pid);
+        let out_csv = format!("/tmp/gsync_{}_out.csv", pid);
 
-        let src_db = source_conn.database.as_deref().unwrap_or("public");
-        let dst_db = target_conn.database.as_deref().unwrap_or("public");
-        let src_table = format!("{}.{}", quote_ident(target_kind, src_db), quote_ident(target_kind, &table_cfg.name));
-        let dst_table = format!("{}.{}", quote_ident(target_kind, dst_db), quote_ident(target_kind, &table_cfg.name));
-
-        let mut where_clause = String::new();
-        if start_cursor > 0 {
-            if let Some(pk) = pk_column {
-                where_clause = format!(" WHERE {} > {}", quote_ident(target_kind, pk), start_cursor);
-            }
-        }
-
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {}{}",
-            dst_table, cols_list, sql_exprs.join(", "), src_table, where_clause,
+        let dump_sql = format!(
+            "SELECT {} FROM {} INTO OUTFILE '{}' \
+             FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' \
+             LINES TERMINATED BY '\\n'",
+            cols_list, quoted_table, raw_csv
         );
+        sqlx::query(&dump_sql).execute(&source_pool).await
+            .with_context(|| "SELECT INTO OUTFILE failed")?;
 
-        sqlx::query(&insert_sql).execute(&mut *conn).await
-            .with_context(|| "Server-side INSERT...SELECT failed")?;
-
-        // Count actual rows
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ghostsync_target.sync_test_users")
-            .fetch_one(&mut *conn)
-            .await
-            .with_context(|| "Failed to count rows")?;
-        table_total = count.0 as u64;
-
-        // Cleanup: unlock table after bulk load
-        sqlx::query("COMMIT").execute(&mut *conn).await?;
-        tracing::info!(
-            "  Table '{}': {} rows synced via server-side INSERT...SELECT",
-            table_cfg.name, table_total,
-        );
-    } else if *target_kind == DbKind::MySql {
-        // ── MySQL cross-server fast path: keyset reader + named pipe → LOAD DATA ──
-        let pid = std::process::id();
-        let fifo_path = format!("/tmp/gsync_{}.fifo", pid);
-
-        nix::unistd::mkfifo(fifo_path.as_str(), nix::sys::stat::Mode::S_IRWXU)
-            .with_context(|| "Failed to create named pipe")?;
-
-        let load_handle: tokio::task::JoinHandle<Result<()>> = {
-            let target_pool = target_pool.clone();
-            let owned_table_name = table_cfg.name.clone();
-            let owned_target_kind = target_kind.clone();
-            let fifo = fifo_path.clone();
-            let q_cols = col_names
-                .iter()
-                .map(|c| quote_ident(&owned_target_kind, c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tokio::spawn(async move {
-                let load_sql = format!(
-                    "LOAD DATA INFILE '{}' INTO TABLE {} CHARACTER SET utf8mb4 \
-                     FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' \
-                     LINES TERMINATED BY '\\n' ({})",
-                    fifo,
-                    quote_table(&owned_target_kind, &owned_table_name),
-                    q_cols
-                );
-                sqlx::query(&load_sql).execute(&target_pool).await
-                    .with_context(|| "LOAD DATA via named pipe failed")?;
-                Ok::<_, anyhow::Error>(())
-            })
-        };
-
-        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<(Vec<AnyRow>, i64)>(3);
-
-        let producer_handle: tokio::task::JoinHandle<Result<()>> = {
-            let select_sql = select_sql.clone();
-            let source_pool = source_pool.clone();
-            let pk_idx = pk_idx;
-            let tx = chunk_tx.clone();
-            tokio::spawn(async move {
-                let mut cursor: i64 = start_cursor;
-                loop {
-                    let raw_rows: Vec<AnyRow> = sqlx::query(&select_sql)
-                        .bind(cursor)
-                        .bind(chunk_size)
-                        .fetch_all(&source_pool)
-                        .await
-                        .with_context(|| format!("Failed to read chunk at cursor={}", cursor))?;
-                    let chunk_len = raw_rows.len();
-                    if chunk_len == 0 {
-                        break;
-                    }
-                    let next_cursor = if use_keyset {
-                        if let Some(idx) = pk_idx {
-                            if let Some(last_row) = raw_rows.last() {
-                                if let Ok(Some(pk_val)) = last_row.try_get::<Option<i64>, usize>(idx) {
-                                    pk_val
-                                } else if let Ok(Some(pk_str)) = last_row.try_get::<Option<String>, usize>(idx) {
-                                    pk_str.parse::<i64>().unwrap_or(cursor + chunk_size)
-                                } else { cursor + chunk_size }
-                            } else { cursor + chunk_size }
-                        } else { cursor + chunk_size }
-                    } else {
-                        cursor + chunk_size
-                    };
-                    tx.send((raw_rows, next_cursor)).await
-                        .map_err(|_| anyhow::anyhow!("Channel closed"))?;
-                    cursor = next_cursor;
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-        };
-
-        let reader_handle: tokio::task::JoinHandle<Result<u64>> = {
-            let rule_engine = rule_engine.clone();
-            let owned_col_names = owned_col_names.clone();
-            let owned_table_name = owned_table_name.clone();
-            let fifo = fifo_path.clone();
-            let batch_rows: usize = (chunk_size as usize).min(50_000);
-            tokio::spawn(async move {
-                let fifo_fd = tokio::fs::File::create(&fifo).await
-                    .with_context(|| "Failed to open FIFO for writing")?;
-                let fd_raw = fifo_fd.try_clone().await
-                    .map_err(|e| anyhow::anyhow!("Failed to clone FIFO fd: {}", e))?;
-                let std_fd = fd_raw.into_std().await;
-                use std::os::unix::io::AsRawFd;
-                const F_SETPIPE_SZ: libc::c_int = 1031;
-                let pipe_sz = unsafe {
-                    libc::fcntl(std_fd.as_raw_fd(), F_SETPIPE_SZ, 1_048_576)
-                };
-                if pipe_sz < 0 {
-                    tracing::warn!("  Failed to increase FIFO pipe buffer (non-fatal): {}", std::io::Error::last_os_error());
-                }
-                drop(std_fd);
-
-                let mut writer = tokio::io::BufWriter::with_capacity(512_000, fifo_fd);
+        // Step 2 — Read raw CSV, apply rules, write processed CSV (on spawn_blocking)
+        tracing::info!("  Same-server MySQL — SELECT INTO OUTFILE → Rust process → LOAD DATA");
+        let csv_handle: tokio::task::JoinHandle<Result<u64>> = {
+            let owned_col_names = col_names.clone();
+            let owned_table_name = table_name.clone();
+            let r = rule_engine.clone();
+            let raw = raw_csv.clone();
+            let out = out_csv.clone();
+            tokio::task::spawn_blocking(move || -> Result<u64> {
+                let data = std::fs::read_to_string(&raw)
+                    .with_context(|| format!("Failed to read {}", &raw))?;
+                let mut out_buf = Vec::with_capacity(data.len());
+                let field_rules = r.get_field_rules(&owned_table_name);
                 let mut total: u64 = 0;
 
-                while let Some((raw_rows, _)) = chunk_rx.recv().await {
-                    for sub_chunk in raw_rows.chunks(batch_rows) {
-                        let csv_data = rows_to_csv(sub_chunk, &owned_col_names, &owned_table_name, &rule_engine);
-                        writer.write_all(&csv_data).await?;
-                        total += sub_chunk.len() as u64;
+                for line in data.lines() {
+                    let fields = parse_csv_line(line);
+                    for (i, col) in owned_col_names.iter().enumerate() {
+                        if i > 0 { out_buf.push(b','); }
+                        let original = fields.get(i).map(|s| s.as_str());
+                        let value = if let Some(rules) = &field_rules {
+                            if let Some((_, rule)) = rules.iter().find(|(f, _)| f.as_str() == col.as_str()) {
+                                match rule.apply(original) {
+                                    crate::rule::RuleResult::Skip => { out_buf.extend_from_slice(b"\\N"); continue; }
+                                    crate::rule::RuleResult::Replace(v) => v,
+                                    crate::rule::RuleResult::PassThrough => original.unwrap_or("").to_string(),
+                                }
+                            } else { original.unwrap_or("").to_string() }
+                        } else { original.unwrap_or("").to_string() };
+                        crate::engine::csv_write_value(&mut out_buf, &value);
                     }
+                    out_buf.push(b'\n');
+                    total += 1;
                 }
-                drop(writer);
+
+                std::fs::write(&out, &out_buf)
+                    .with_context(|| format!("Failed to write {}", &out))?;
                 Ok(total)
             })
         };
-        drop(chunk_tx);
 
-        producer_handle.await
-            .map_err(|e| anyhow::anyhow!("Producer panicked: {:?}", e))??;
-        let rows_synced = reader_handle.await
-            .map_err(|e| anyhow::anyhow!("Reader panicked: {:?}", e))??;
-        load_handle.await
-            .map_err(|e| anyhow::anyhow!("LOAD DATA panicked: {:?}", e))??;
+        let rows_synced = csv_handle.await
+            .map_err(|e| anyhow::anyhow!("CSV processing panicked: {:?}", e))??;
+
+        // Step 3 — LOAD DATA from the processed CSV
+        let load_sql = format!(
+            "LOAD DATA INFILE '{}' INTO TABLE {} CHARACTER SET utf8mb4 \
+             FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' \
+             LINES TERMINATED BY '\\n' ({})",
+            out_csv,
+            quote_table(target_kind, &table_cfg.name),
+            cols_list,
+        );
+        sqlx::query(&load_sql).execute(&target_pool).await
+            .with_context(|| "LOAD DATA INFILE failed")?;
 
         table_total = rows_synced;
-        let _ = std::fs::remove_file(&fifo_path);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&raw_csv);
+        let _ = std::fs::remove_file(&out_csv);
     } else {
-        // ── PostgreSQL path: keep original INSERT approach ──
+        // ── Generic INSERT path (cross-server MySQL + PostgreSQL) ──
         let insert_sql = build_insert_sql(target_kind, &table_name, &col_refs);
         let batch_size: usize = task.batch_size.max(1).min(10_000) as usize;
 
@@ -776,64 +682,6 @@ where
     Ok(())
 }
 
-// ─── CSV Writer (MySQL LOAD DATA path) ─────────────────────────────
-
-/// Process rows through the rule engine and write to CSV format.
-///
-/// Each row becomes one CSV line. NULL values → `\N` (MySQL LOAD DATA convention).
-/// String values are CSV-escaped (quotes doubled, commas/newlines quoted).
-fn rows_to_csv(
-    rows: &[AnyRow],
-    col_names: &[String],
-    table: &str,
-    engine: &RuleEngine,
-) -> Vec<u8> {
-    // Estimate: ~50 bytes per cell, 8 columns, 2 bytes separators
-    let estimated = rows.len() * col_names.len() * 55;
-    let mut buf = Vec::with_capacity(estimated);
-
-    // Pre-lookup the field rules for this table
-    let field_rules: Option<&Vec<(String, Box<dyn crate::rule::Rule>)>> = engine.get_field_rules(table);
-
-    for row in rows {
-        for (i, col) in col_names.iter().enumerate() {
-            if i > 0 {
-                buf.push(b',');
-            }
-
-            if let Some(rules) = field_rules {
-                if let Some((_, rule)) = rules.iter().find(|(f, _)| f.as_str() == col.as_str()) {
-                    let value = get_value_from_row(row, i);
-                    match rule.apply(value.as_deref()) {
-                        crate::rule::RuleResult::Skip => {
-                            buf.extend_from_slice(b"\\N");
-                            continue;
-                        }
-                        crate::rule::RuleResult::Replace(new_val) => {
-                            csv_write_value(&mut buf, &new_val);
-                            continue;
-                        }
-                        crate::rule::RuleResult::PassThrough => {
-                            // Fall through to write original
-                        }
-                    }
-                }
-            }
-
-            // No rule or PassThrough: write original value
-            let value = get_value_from_row(row, i);
-            match value {
-                Some(v) => csv_write_value(&mut buf, &v),
-                None => buf.extend_from_slice(b"\\N"),
-            }
-        }
-        buf.push(b'\n');
-    }
-
-    buf
-}
-
-/// Extract a nullable string value from an `AnyRow` at the given column index.
 fn get_value_from_row(row: &AnyRow, idx: usize) -> Option<String> {
     row.try_get::<Option<String>, _>(idx)
         .or_else(|_| {
@@ -849,6 +697,46 @@ fn get_value_from_row(row: &AnyRow, idx: usize) -> Option<String> {
                 .map(|v| v.map(|b| b.to_string()))
         })
         .unwrap_or(None)
+}
+
+/// Parse a single CSV line into fields, handling standard CSV quoting.
+///
+/// Supports: quoted fields with `""` escapes, unquoted fields, and MySQL's
+/// `\N` NULL representation (which is an unquoted `\N`).
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_quotes => {
+                in_quotes = true;
+            }
+            '"' if in_quotes => {
+                // Check for escaped quote ("")
+                if chars.peek() == Some(&'"') {
+                    chars.next(); // consume second quote
+                    current.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            }
+            ',' if !in_quotes => {
+                fields.push(current.clone());
+                current.clear();
+            }
+            '\n' | '\r' if !in_quotes => {
+                // Skip newlines outside quotes, they're leftover from \r\n
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    fields.push(current);
+    fields
 }
 
 /// Write a single CSV field value to the buffer, escaping as needed.
@@ -875,97 +763,7 @@ fn csv_write_value(buf: &mut Vec<u8>, value: &str) {
     }
 }
 
-/// Async version: write a single CSV field to a `tokio::io::BufWriter`.
-async fn csv_write_value_to_writer<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut tokio::io::BufWriter<W>,
-    value: &str,
-) -> Result<()> {
-    if value.is_empty() {
-        writer.write_all(b"\\N").await?;
-        return Ok(());
-    }
-    let needs_quoting = value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\\');
-    if needs_quoting {
-        writer.write_all(b"\"").await?;
-        for ch in value.chars() {
-            if ch == '"' {
-                writer.write_all(b"\"\"").await?;
-            } else {
-                let mut buf = [0u8; 4];
-                writer.write_all(ch.encode_utf8(&mut buf).as_bytes()).await?;
-            }
-        }
-        writer.write_all(b"\"").await?;
-    } else {
-        writer.write_all(value.as_bytes()).await?;
-    }
-    Ok(())
-}
 
-// ─── Same-server MySQL Optimisation ────────────────────────────────
-
-/// Check whether source and target point to the same database host:port.
-fn is_same_db_server(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
-    a.host == b.host && a.port == b.port
-}
-
-/// Convert a rule configuration into a SQL expression for the target DB.
-///
-/// Returns `NULL AS col` for Ignore, native SQL functions for masking /
-/// hashing, and the literal column name for pass-through.
-fn rule_to_sql_expr(col: &str, rule: &RuleType, params: Option<&HashMap<String, String>>, kind: &DbKind) -> String {
-    let q = match kind {
-        DbKind::MySql => format!("`{}`", col),
-        DbKind::Postgres => format!("\"{}\"", col),
-    };
-    match rule {
-        RuleType::Ignore => format!("NULL AS {}", q),
-        RuleType::MaskPhone => {
-            // Get mask string (default: "****")
-            let mask_str = params
-                .and_then(|p| p.get("mask_str"))
-                .map(|s| s.as_str())
-                .unwrap_or("****");
-            // CONCAT / LEFT / RIGHT work on both MySQL and PostgreSQL
-            format!(
-                "CONCAT(LEFT({}, 3), '{}', RIGHT({}, 4)) AS {}",
-                q, mask_str, q, q
-            )
-        }
-        RuleType::MaskEmail => {
-            // Get mask string (default: "****")
-            let mask_str = params
-                .and_then(|p| p.get("mask_str"))
-                .map(|s| s.as_str())
-                .unwrap_or("****");
-            match kind {
-                DbKind::MySql => format!(
-                    "CONCAT(LEFT({}, 1), '{}', SUBSTRING_INDEX({}, '@', -1)) AS {}",
-                    q, mask_str, q, q
-                ),
-                DbKind::Postgres => format!(
-                    "CONCAT(LEFT({}, 1), '{}', SPLIT_PART({}, '@', 2)) AS {}",
-                    q, mask_str, q, q
-                ),
-            }
-        }
-        RuleType::Hash => {
-            let algorithm = params
-                .and_then(|p| p.get("algorithm"))
-                .map(|s| s.to_lowercase())
-                .unwrap_or_else(|| "sha256".to_string());
-            match (kind, algorithm.as_str()) {
-                (_, "md5") => format!("MD5({}) AS {}", q, q),
-                (DbKind::MySql, "crc32") => format!("CRC32({}) AS {}", q, q),
-                (DbKind::Postgres, "crc32") => format!("(('x' || MD5({}))::BIT(128)::INTEGER % 2147483647) AS {}", q, q),
-                (DbKind::MySql, "sha1") => format!("SHA1({}) AS {}", q, q),
-                (DbKind::Postgres, "sha1") => format!("ENCODE(DIGEST({}, 'sha1'), 'hex') AS {}", q, q),
-                (DbKind::MySql, _) => format!("SHA2({}, 256) AS {}", q, q),
-                (DbKind::Postgres, _) => format!("ENCODE(DIGEST({}, 'sha256'), 'hex') AS {}", q, q),
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

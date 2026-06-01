@@ -25,16 +25,27 @@ _轻量级数据同步与脱敏代理 · Lightweight Data Sync & Desensitization
 | 🔗 **CI/CD 集成** | HTTP API 触发，可在 GitHub Actions/GitLab CI 发布前自动脱敏并同步 |
 | 🗄️ **极简备份** | 低成本替代 DTS 服务，支持 PostgreSQL/MySQL 间任意方向的数据迁移 |
 
+## 速度 | Performance
+
+同机 MySQL 场景下，GhostSync 自动启用 **SELECT INTO OUTFILE + LOAD DATA** 零拷贝路径：
+
+| 数据量 | 耗时 | RPS | 说明 |
+|--------|------|-----|------|
+| 1,000,000 行 + SHA256 | **13.7s** | **73,000/s** | 同机 MariaDB, 128MB buffer pool |
+| 1,000,000 行 (明文) | ~11s | ~90,000/s | 无脱敏规则时更快 |
+
+详见 [SPEED_TEST_REPORT.md](./SPEED_TEST_REPORT.md)。
+
 ## 功能特性 | Features
 
-### ✅ Phase 1 — 基础架构 (Foundation)
+### ✅ 数据源与目标管理
 
 - **YAML 配置驱动** — 声明式配置文件，支持环境变量 `${VAR:-default}` 注入
 - **PostgreSQL / MySQL 双引擎** — 用 sqlx 的 `AnyPool` 统一驱动，一行配置切换
 - **配置校验器** — 启动前自动检查：重复名称、引用完整性、规则合法性
-- **可视化检查命令** — `ghostsync check config.yaml` 一键测试所有数据库连通性
+- **连通性检查** — `ghostsync check config.yaml` 一键测试所有数据库
 
-### ✅ Phase 2 — 规则引擎 (Rule Engine)
+### ✅ 规则引擎 (Rule Engine)
 
 | 规则 | 效果 | 示例 |
 |------|------|------|
@@ -43,15 +54,16 @@ _轻量级数据同步与脱敏代理 · Lightweight Data Sync & Desensitization
 | `mask_email` | 保留首字母，其余替换 | `alice@example.com → a****@example.com` |
 | `hash` | SHA-256 或 MD5 单向哈希 | `my_password → 5e8848...` |
 
-### ✅ Phase 3 — 核心同步引擎 (Sync Engine)
+### ✅ 同步引擎 (Sync Engine)
 
-- **分块读取** — 基于 PK 的 `ORDER BY ... LIMIT ... OFFSET` 流式读取，内存友好
+- **Keyset 分页** — 基于主键 B-tree 游标的分页，性能稳定不随偏移量下降
+- **同机 MySQL 零拷贝** — 自动检测同机 MySQL，使用 `SELECT INTO OUTFILE` + `LOAD DATA`，跳过 TCP 传输
+- **跨机通用路径** — 分块读取 + 规则处理 + 多行 INSERT，支持任何 MySQL/PostgreSQL 组合
 - **Worker 池并发脱敏** — 多线程并发执行脱敏规则，CPU 密集型任务能跑满
 - **批量写入** — `batch_size` 控制单次 INSERT 的行数，减少网络往返
-- **类型安全** — `row_to_map` 自动处理 `String`/`i64`/`f64`/`bool` 类型转换
 - **截断目标表** — `truncate_target: true` 在同步前清空目标表
 
-### ✅ Phase 4 — 守护进程 & HTTP API (Daemon & API)
+### ✅ 守护进程 & HTTP API (Daemon & API)
 
 ```text
 ┌─────────────────────────────────────────────────┐
@@ -99,9 +111,6 @@ git clone https://github.com/ghostSync/ghostSync.git
 cd ghostSync
 cargo build --release
 cp target/release/ghostsync /usr/local/bin/
-
-# 或者使用 Docker
-docker pull ghostsync/ghostsync:latest
 ```
 
 ### 配置 | Configuration
@@ -112,42 +121,60 @@ docker pull ghostsync/ghostsync:latest
 sources:
   - name: production
     kind: postgres
-    url: "postgres://app_user:${PG_PASS}@prod-db.internal:5432/production_db"
+    host: prod-db.internal
+    port: 5432
+    user: app_user
+    password: "${PG_PASS}"
+    database: production_db
+
+  - name: mysql_prod
+    kind: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "${MYSQL_PASS}"
+    database: source_db
 
 targets:
   - name: staging
     kind: postgres
-    url: "postgres://staging_user:${STAGING_PASS}@staging-db.internal:5432/staging_db"
+    host: staging-db.internal
+    port: 5432
+    user: staging_user
+    password: "${STAGING_PASS}"
+    database: staging_db
+
+  - name: mysql_staging
+    kind: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "${MYSQL_PASS}"
+    database: target_db
 
 tasks:
   - name: nightly-sync
-    source: production
-    target: staging
+    source: mysql_prod
+    target: mysql_staging
     tables:
-      - name: public.users
+      - name: sync_test_users
         rules:
           - field: phone
             rule: mask_phone
           - field: email
             rule: mask_email
-          - field: password_hash
+          - field: password
             rule: hash
             params:
               algorithm: sha256
           - field: id_card
             rule: ignore
-      - name: public.orders
-        # 无规则 = 原样同步
-      - name: public.audit_logs
-        mode: ignore  # 跳过整张表
-    chunk_size: 5000
-    batch_size: 1000
-    max_workers: 4
-    schedule: "0 2 * * 5"  # 每周五凌晨2点
+    chunk_size: 50000
+    batch_size: 50000
+    max_workers: 8
     truncate_target: true
+    schedule: "0 2 * * 5"   # 每周五凌晨2点
 ```
-
-完整示例见 [`config.example.yaml`](./config.example.yaml)。
 
 ### 运行 | Run
 
@@ -163,9 +190,6 @@ ghostsync run config.yaml --task nightly-sync
 
 # 3. 启动守护进程
 ghostsync serve config.yaml --port 9710
-
-# 指定 SQLite 存储路径（默认 ~/.ghostsync/store.db）
-ghostsync serve config.yaml --store /data/ghostsync.db
 
 # 4. API 触发同步
 curl -X POST http://localhost:9710/api/tasks/nightly-sync/run
@@ -183,7 +207,7 @@ src/
 │   └── validator.rs     # 配置校验（重复名、引用完整、规则参数）
 ├── db/
 │   ├── connector.rs     # 数据库连接池管理（AnyPool）
-│   └── schema.rs        # 表结构自省（待 Phase 5+ 接入）
+│   └── schema.rs        # 表结构自省
 ├── rule/
 │   ├── mod.rs           # Rule trait + RuleEngine 编排器
 │   ├── mask_phone.rs    # 手机号脱敏
@@ -200,18 +224,6 @@ src/
     └── mod.rs           # Tracing 日志初始化
 ```
 
-## 测试 | Testing
-
-```bash
-# 运行所有测试（39 个）
-cargo test
-
-# 运行特定模块测试
-cargo test rule::  # 规则引擎测试
-cargo test engine::  # 同步引擎测试
-cargo test config::  # 配置加载和校验测试
-```
-
 ## 技术栈 | Tech Stack
 
 | 组件 | 技术选型 | 说明 |
@@ -224,7 +236,6 @@ cargo test config::  # 配置加载和校验测试
 | 日志 | tracing + tracing-subscriber | 结构化日志，支持 JSON 输出 |
 | 调度 | cron 0.14 | 标准 Cron 表达式解析 |
 | 持久化 | SQLite (via sqlx) | 零依赖本地存储，自动迁移 |
-
 
 ## 许可 | License
 

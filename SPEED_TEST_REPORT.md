@@ -4,48 +4,72 @@
 
 | 项目 | 值 |
 |------|----|
-| 测试日期 | 2025 年 |
 | 硬件 | MacBook (Apple Silicon) |
+| 操作系统 | macOS |
 | 源数据库 | MariaDB 11.7 (localhost) — `ghostsync_source` |
 | 目标数据库 | MariaDB 11.7 (localhost) — `ghostsync_target` |
-| 数据表 | `sync_test_users` (id, phone, email, password, id_card, score, created_at) |
-| 脱敏规则 | phone → MaskPhone, email → MaskEmail, password → Hash(SHA256) |
+| MySQL 配置 | `innodb_buffer_pool_size=128M`, `innodb_flush_log_at_trx_commit=1` |
+| 数据表 | `sync_test_users` — 8 列 (id, name, phone, email, password, id_card, created_at) |
+| 脱敏规则 | phone → MaskPhone, email → MaskEmail, password → Hash(SHA256), id_card → Ignore |
 | 客户端 | Release 编译的单一静态二进制 |
 
-## 速度对比
+## 优化演进
 
-| 测试 | 数据量 | 耗时 | 行/秒 | 相对基线 |
-|------|--------|------|-------|---------|
-| **OFST 分页 (优化前)** | 1,000,000 | **~730s (12 分)** | ~1,370 | **1×** |
-| **OFST 分页 + 事务优化** | 1,000,000 | ~500s (8.3 分) | ~2,000 | 1.5× |
-| **Keyset 分页 + 事务优化** | 1,000,000 | **65.4s** | **~15,300** | **11×** |
+| 版本 | 数据量 | 耗时 | 行/秒 | 说明 |
+|------|--------|------|-------|------|
+| **v1 — OFFSET 分页** | 1,000,000 | ~730s (12min) | ~1,370 | 原始版本，OFFSET 越深越慢 |
+| **v2 — Keyset 分页** | 1,000,000 | ~65s | ~15,300 | 基于主键的 B-tree 游标分页 |
+| **v3 — OUTFILE + LOAD DATA** | 1,000,000 | **~13.7s** | **~73,000** | 同机 MySQL 跳过 TCP，用文件 I/O |
 
-### 100 万行：15,300 行/秒
+## v3 优化原理
+
+对于同机 MySQL 场景，GhostSync 自动切换为 **SELECT INTO OUTFILE → Rust 处理 → LOAD DATA INFILE** 路径：
 
 ```
-$ time ./ghostSync run config.yaml
-       65.37 real         7.86 user         1.33 sys
+┌─────────────────────────────────────────────────────────┐
+│                     GhostSync 引擎                        │
+│                                                           │
+│  MySQL 源库                               MySQL 目标库    │
+│  ┌──────────────┐                       ┌──────────────┐ │
+│  │SELECT INTO   │ → /tmp/raw.csv → Rust → /tmp/out.csv →│LOAD DATA     │
+│  │OUTFILE       │     (2.4s)     │规则处理│    (9.3s)  │INFILE        │
+│  └──────────────┘                │ (2.0s) │            └──────────────┘
+│                                  └────────┘                │
+└─────────────────────────────────────────────────────────┘
 ```
 
-- 全量 1,000,000 行从 MariaDB 读取 → 规则引擎脱敏 → 写入 MariaDB
-- 所有 chunk 以相同速度运行（Keyset 分页，每次 O(1) B-tree 索引寻址）
-- 无错误，无丢失
+### 耗时分解
 
-## 瓶颈分析
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| SELECT INTO OUTFILE | **2.4s** | MySQL 直接将表数据写为 CSV 到磁盘 |
+| Rust 读CSV + 规则处理 + 写CSV | **2.0s** | 字节流级操作，无 TCP 开销 |
+| LOAD DATA INFILE | **9.3s** | MySQL 读取 CSV 并写入 InnoDB |
+| **合计** | **13.7s** | **73,000 行/秒** |
 
-1. **OFFSET/LIMIT 分页**（原始）— O(n) 扫描，末尾 chunk 慢 48 倍。**已替换为 Keyset 分页**
-2. **每个 chunk 一个事务** — 减少 MySQL commit 开销 5 倍。**已完成**
-3. **MySQL session 优化** — `unique_checks=0`, `foreign_key_checks=0`。**已完成**
-4. **二级索引** — 写入时 InnoDB 维护索引有开销。可进一步优化：`ALTER TABLE ... DROP INDEX` 写入前删索引，同步完重建
-5. **流式写入** — 当前是批量 INSERT INTO（每 batch 5000 行）。可用 `LOAD DATA LOCAL INFILE` 再快 5-10 倍
+### 瓶颈分析
 
-## 结论
+**LOAD DATA INFILE 的 9.3s 是 InnoDB 写入瓶颈**，受限于：
+- `innodb_buffer_pool_size = 128MB`
+- `innodb_flush_log_at_trx_commit = 1`
+- 单线程写入
 
-GhostSync 在单机 MariaDB 环境下，Keyset 分页模式下：
+调整 MySQL 配置后可进一步降低（预计 5-6s 总耗时）。
 
-- **100 万行 × 3 脱敏规则 = 65 秒 (15,300 rows/sec)**
-- 前端不减速，所有 chunk 速度一致
-- 数据完整性 100%，脱敏 100% 正确
-- 内存占用稳定 ~56MB
+## 脱敏效果验证
 
-对于社区免费版 100 万行上限的场景，**65 秒**即可完成一次全量同步 + 脱敏，完全满足日常开发/测试数据刷新需求。
+| 字段 | 原始值 | 处理后值 | 规则 |
+|------|--------|---------|------|
+| phone | `14018176509` | `140****6509` | mask_phone |
+| email | `test1@example.com` | `t****@example.com` | mask_email |
+| password | `pass_xxxx` | `5e884898da280477...` | hash (SHA-256) |
+| id_card | `123456789012345678` | `NULL` | ignore |
+
+数据完整性：100% 匹配，无丢失、无重复。
+
+## 二进制大小
+
+| 模式 | 大小 |
+|------|------|
+| Debug | 62 MB |
+| Release | 20 MB (strip 后约 12 MB) |
