@@ -1,0 +1,38 @@
+sources:
+  - name: source_db
+    kind: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "123456789"
+    database: ghostsync_source
+
+targets:
+  - name: target_db
+    kind: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "123456789"
+    database: ghostsync_target
+
+tasks:
+  - name: mysql-speed-test
+    source: source_db
+    target: target_db
+    tables:
+      - name: sync_test_users
+        rules:
+          - field: phone
+            rule: mask_phone
+          - field: email
+            rule: mask_email
+          - field: password
+            rule: hash
+          - field: id_card
+            rule: ignore
+    chunk_size: 5000
+    batch_size: 1000
+    max_workers: 8
+    truncate_target: true
+    schedule: ""
