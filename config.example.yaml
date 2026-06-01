@@ -1,0 +1,106 @@
+# =============================================================================
+# GhostSync Configuration Example
+# =============================================================================
+# Usage:
+#   ghostsync run config.example.yaml
+#   ghostsync check config.example.yaml
+#   ghostsync inspect config.example.yaml
+#   ghostsync run config.example.yaml --task nightly-sync-user
+#
+# Environment variables: ${VAR_NAME} or ${VAR_NAME:-default_value}
+# =============================================================================
+
+# ─── Data Sources ─────────────────────────────────────────────────────────
+
+sources:
+  - name: production
+    kind: postgres
+    # Mode 1: Full URL (recommended for env vars)
+    url: "postgres://app_user:${PG_PASS}@prod-db.internal:5432/production_db?sslmode=require"
+
+  - name: prod-mysql
+    kind: mysql
+    # Mode 2: Individual fields
+    host: prod-mysql.internal
+    port: 3306
+    database: ecommerce
+    user: app_user
+    password: ${MYSQL_PASS}
+    ssl_mode: prefer
+
+# ─── Data Targets ─────────────────────────────────────────────────────────
+
+targets:
+  - name: staging
+    kind: postgres
+    url: "postgres://staging_user:${STAGING_PASS}@staging-db.internal:5432/staging_db"
+
+  - name: dev-mysql
+    kind: mysql
+    host: localhost
+    port: 3307
+    database: ecommerce_dev
+    user: dev_user
+    password: "${DEV_PASS:-dev_password}"
+
+# ─── Sync Tasks ───────────────────────────────────────────────────────────
+
+tasks:
+  # ── Task 1: Weekly production-to-staging sync ──────────────────────
+  - name: nightly-sync-user
+    source: production
+    target: staging
+    tables:
+      - name: public.users
+        # Per-field masking rules
+        rules:
+          - field: phone
+            rule: mask_phone
+            params:
+              prefix: "138"
+          - field: email
+            rule: mask_email
+            params:
+              domain: "sanitized.com"
+          - field: password_hash
+            rule: hash
+            params:
+              algorithm: sha256
+          - field: id_card
+            rule: ignore   # Skip this field entirely
+
+      - name: public.orders
+        # No rules = pass through as-is
+
+      - name: public.audit_logs
+        mode: ignore  # Skip this table entirely
+
+    # Performance tuning
+    chunk_size: 5000      # Rows per SELECT chunk
+    batch_size: 1000      # Rows per INSERT batch
+    max_workers: 4         # Concurrent transformation workers
+    rate_limit: 0          # 0 = unlimited rows/sec
+
+    # Schedule (optional — leave out for manual-only)
+    schedule: "0 2 * * 5"  # Every Friday at 2:00 AM
+
+    # If true, truncate target table before inserting
+    truncate_target: true
+
+  # ── Task 2: MySQL product sync ─────────────────────────────────────
+  - name: nightly-sync-products
+    source: prod-mysql
+    target: dev-mysql
+    tables:
+      - name: products
+        rules:
+          - field: supplier_phone
+            rule: mask_phone
+          - field: supplier_email
+            rule: mask_email
+
+    chunk_size: 10000
+    batch_size: 2000
+    max_workers: 8
+    schedule: "0 3 * * *"  # Every day at 3:00 AM
+    truncate_target: true

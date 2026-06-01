@@ -1,0 +1,57 @@
+[package]
+name = "ghostSync"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight data sync & desensitization proxy for developers"
+authors = ["ghostSync Team"]
+repository = "https://github.com/ghostSync/ghostSync"
+keywords = ["database", "sync", "data-masking", "etl", "devops"]
+categories = ["database", "command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "postgres", "mysql", "sqlite"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Web server (for API trigger)
+axum = "0.7"
+
+# Logging & observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Regex
+regex = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Random / fake data generation
+rand = "0.8"
+
+# Async mutex / stream processing
+tokio-stream = "0.1"
+
+# Hashing (rule engine)
+sha2 = "0.10"
+md-5 = "0.10"
+
+# Cron expression parsing
+cron = "0.14"
+
+[dev-dependencies]
+temp-env = "0.3"
