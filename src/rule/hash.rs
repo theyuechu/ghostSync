@@ -1,9 +1,10 @@
 use sha2::{Digest, Sha256};
 use md5::Md5;
+use crc32fast::Hasher as Crc32;
 
 use super::{Rule, RuleResult};
 
-/// Hash a string value using SHA-256 or MD5.
+/// Hash a string value using SHA-256, MD5, or CRC32.
 ///
 /// - Returns the hex-encoded hash.
 /// - NULL values pass through unchanged (not hashed).
@@ -29,6 +30,11 @@ impl Rule for HashRule {
                 let mut hasher = Md5::new();
                 hasher.update(s.as_bytes());
                 format!("{:x}", hasher.finalize())
+            }
+            "crc32" => {
+                let mut hasher = Crc32::new();
+                hasher.update(s.as_bytes());
+                format!("{:08x}", hasher.finalize())
             }
             // Default to sha256
             _ => {
@@ -65,6 +71,17 @@ mod tests {
         let result = rule.apply(Some("hello"));
         // known md5 of "hello"
         let expected = "5d41402abc4b2a76b9719d911017c592";
+        assert_eq!(result, RuleResult::Replace(expected.into()));
+    }
+
+    #[test]
+    fn test_crc32_hash() {
+        let rule = HashRule {
+            algorithm: "crc32".into(),
+        };
+        let result = rule.apply(Some("hello"));
+        // known crc32 of "hello"
+        let expected = "3610a686";
         assert_eq!(result, RuleResult::Replace(expected.into()));
     }
 

@@ -49,6 +49,13 @@ tokio-stream = "0.1"
 # Hashing (rule engine)
 sha2 = "0.10"
 md-5 = "0.10"
+crc32fast = "1"
+
+# Named pipes (FIFO) for MySQL LOAD DATA streaming
+nix = { version = "0.29", features = ["fs"] }
+
+# Raw fcntl for F_SETPIPE_SZ (not exposed in nix 0.29)
+libc = "0.2"
 
 # Cron expression parsing
 cron = "0.14"

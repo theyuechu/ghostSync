@@ -8,12 +8,19 @@ use crate::config::types::{ConnectionConfig, DbKind};
 
 /// Create a connection pool from the given config.
 pub async fn create_pool(kind: &DbKind, conn: &ConnectionConfig) -> Result<AnyPool> {
-    let url = conn
+    let mut url = conn
         .url
         .as_ref()
-        .context("Connection URL is required (resolve() must be called first)")?;
+        .context("Connection URL is required (resolve() must be called first)")?
+        .clone();
 
-    let opts = AnyConnectOptions::from_str(url)
+    // Enable LOCAL INFILE for MySQL (required by LOAD DATA LOCAL INFILE)
+    if *kind == DbKind::MySql && !url.contains("local-infile") {
+        let separator = if url.contains('?') { "&" } else { "?" };
+        url.push_str(&format!("{}local-infile=true", separator));
+    }
+
+    let opts = AnyConnectOptions::from_str(&url)
         .with_context(|| format!("Failed to parse connection URL: {}", url))?;
 
     let pool_opts = AnyPoolOptions::new()

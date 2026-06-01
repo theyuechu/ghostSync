@@ -136,6 +136,7 @@ async fn cmd_run(config_path: &PathBuf, task_name: Option<&str>, dry_run: bool) 
                 &source_conn,
                 &target_cfg.db_kind,
                 &target_conn,
+                None,
             )
             .await
             {

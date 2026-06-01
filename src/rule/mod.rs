@@ -111,6 +111,12 @@ impl RuleEngine {
         self.ignored_tables.contains(table)
     }
 
+    /// Return the field rules for a table, if any.
+    /// The Vec contains (field_name, rule) pairs.
+    pub fn get_field_rules(&self, table: &str) -> Option<&Vec<(String, Box<dyn Rule>)>> {
+        self.field_rules.get(table)
+    }
+
     /// Apply all configured rules to a single row.
     ///
     /// Returns `(transformed_row, was_modified)`.
@@ -274,6 +280,7 @@ mod tests {
             schedule: None,
             dry_run: false,
             truncate_target: false,
+            incremental: false,
         }
     }
 

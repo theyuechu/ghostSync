@@ -191,6 +191,12 @@ pub struct TaskConfig {
     /// If true, truncate target table before sync (default: false)
     #[serde(default)]
     pub truncate_target: bool,
+
+    /// Enable incremental sync using cursor persistence (default: false).
+    /// When true and a store is available, GhostSync saves the max PK
+    /// value after each run and resumes from that point on the next run.
+    #[serde(default)]
+    pub incremental: bool,
 }
 
 const fn default_chunk_size() -> u64 {

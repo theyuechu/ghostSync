@@ -85,6 +85,74 @@ impl Store {
         .execute(pool)
         .await?;
 
+        // Sync cursors table for incremental sync
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS sync_cursors (
+                task_name   TEXT NOT NULL,
+                table_name  TEXT NOT NULL,
+                cursor_val  INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY (task_name, table_name)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Save the cursor position for a (task, table) pair.
+    /// Used by incremental sync to resume from where it left off.
+    pub async fn save_cursor(&self, task_name: &str, table_name: &str, cursor_val: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO sync_cursors (task_name, table_name, cursor_val, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task_name, table_name) DO UPDATE SET
+                cursor_val = excluded.cursor_val,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(task_name)
+        .bind(table_name)
+        .bind(cursor_val)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .context("Failed to save sync cursor")?;
+        Ok(())
+    }
+
+    /// Load the last saved cursor for a (task, table) pair.
+    /// Returns `None` if no prior sync has been recorded (first full sync).
+    pub async fn load_cursor(&self, task_name: &str, table_name: &str) -> Result<Option<i64>> {
+        let row: Option<i64> = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT cursor_val FROM sync_cursors
+            WHERE task_name = ? AND table_name = ?
+            "#,
+        )
+        .bind(task_name)
+        .bind(table_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Delete the cursor for a (task, table) pair (e.g. after a full resync).
+    pub async fn delete_cursor(&self, task_name: &str, table_name: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM sync_cursors WHERE task_name = ? AND table_name = ?
+            "#,
+        )
+        .bind(task_name)
+        .bind(table_name)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

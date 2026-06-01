@@ -91,9 +91,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
                         RuleType::Hash => {
                             if let Some(params) = &rule_conf.params {
                                 if let Some(algo) = params.get("algorithm") {
-                                    if algo != "sha256" && algo != "md5" {
+                                    if algo != "sha256" && algo != "sha1" && algo != "md5" && algo != "crc32" {
                                         bail!(
-                                            "Task '{}', table '{}', field '{}': hash algorithm must be 'sha256' or 'md5', got '{}'",
+                                            "Task '{}', table '{}', field '{}': hash algorithm must be 'sha256', 'sha1', 'md5', or 'crc32', got '{}'",
                                             task.name, table.name, rule_conf.field, algo
                                         );
                                     }
@@ -166,6 +166,7 @@ mod tests {
                 schedule: None,
                 dry_run: false,
                 truncate_target: false,
+                incremental: false,
             }],
         }
     }

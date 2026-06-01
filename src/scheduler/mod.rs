@@ -233,6 +233,7 @@ async fn execute_and_log_task(task: &TaskConfig, cfg: &Config, store: &Option<Ar
         &source_cfg.connection,
         &target_cfg.db_kind,
         &target_cfg.connection,
+        store.clone(),
     )
     .await
     {
