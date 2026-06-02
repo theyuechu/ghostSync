@@ -249,6 +249,7 @@ mod tests {
             dry_run: false,
             truncate_target: false,
             incremental: false,
+            backup: None,
         }
     }
 

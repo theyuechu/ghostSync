@@ -165,6 +165,10 @@ pub struct TaskConfig {
     /// value after each run and resumes from that point on the next run.
     #[serde(default)]
     pub incremental: bool,
+
+    /// Backup configuration (optional).
+    /// When set, processed data is also saved as CSV file(s).
+    pub backup: Option<BackupConfig>,
 }
 
 const fn default_chunk_size() -> u64 {
@@ -204,6 +208,42 @@ pub enum TableMode {
     #[serde(rename = "sync")]
     #[default]
     Sync,
+}
+
+// ─── Backup Config ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+pub enum BackupMode {
+    /// No backup (default)
+    #[serde(rename = "none")]
+    #[default]
+    None,
+    /// Save processed data as CSV file(s)
+    #[serde(rename = "file")]
+    File,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BackupConfig {
+    /// Backup mode (default: "none")
+    #[serde(default)]
+    pub mode: BackupMode,
+
+    /// Output directory for backup files (default: "./backups")
+    #[serde(default = "default_backup_dir")]
+    pub dir: String,
+
+    /// Whether to gzip backup files (default: true)
+    #[serde(default = "default_bool_true")]
+    pub compress: bool,
+}
+
+fn default_backup_dir() -> String {
+    "./backups".to_string()
+}
+
+fn default_bool_true() -> bool {
+    true
 }
 
 // ─── Rule Config ───────────────────────────────────────────────────

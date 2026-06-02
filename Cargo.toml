@@ -51,6 +51,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 crc32fast = "1"
 
+# Compression (CSV backup)
+flate2 = "1"
+
 # Cron expression parsing
 cron = "0.14"
 

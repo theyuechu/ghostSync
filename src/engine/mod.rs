@@ -10,12 +10,15 @@ use anyhow::{Context, Result};
 use sqlx::any::AnyRow;
 use sqlx::{Executor, Row};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing;
 
-use crate::config::types::{ConnectionConfig, DbKind, TableConfig, TableMode, TaskConfig};
+use crate::config::types::{
+    BackupMode, ConnectionConfig, DbKind, TableConfig, TableMode, TaskConfig,
+};
 use crate::db::connector;
 use crate::db::schema::introspect_table;
 use crate::rule::RuleEngine;
@@ -333,7 +336,7 @@ async fn sync_one_table(
                                 }
                             } else { original.unwrap_or("").to_string() }
                         } else { original.unwrap_or("").to_string() };
-                        crate::engine::csv_write_value(&mut out_buf, &value);
+                        crate::engine::csv_write_value(&mut out_buf, &value)?;
                     }
                     out_buf.push(b'\n');
                     total += 1;
@@ -362,13 +365,50 @@ async fn sync_one_table(
 
         table_total = rows_synced;
 
-        // Cleanup
+        // ── CSV file backup (MySQL same-server path) ──
+        if let Some(backup) = &task.backup {
+            if backup.mode == BackupMode::File && rows_synced > 0 {
+                std::fs::create_dir_all(&backup.dir)
+                    .with_context(|| format!("Failed to create backup dir: {}", backup.dir))?;
+                let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let safe_name = table_name.replace('.', "_");
+                let backup_path = format!("{}/{}_{}.csv", backup.dir, safe_name, ts);
+                std::fs::copy(&out_csv, &backup_path)
+                    .with_context(|| format!("Failed to copy backup CSV to {}", backup_path))?;
+
+                if backup.compress {
+                    gzip_file(&backup_path)?;
+                    tracing::info!("  Backup: {}.csv.gz saved ({})", backup_path, rows_synced);
+                } else {
+                    tracing::info!("  Backup: {}.csv saved ({})", backup_path, rows_synced);
+                }
+            }
+        }
+
+        // Cleanup temp files
         let _ = std::fs::remove_file(&raw_csv);
         let _ = std::fs::remove_file(&out_csv);
     } else {
         // ── Generic INSERT path (cross-server MySQL + PostgreSQL) ──
         let insert_sql = build_insert_sql(target_kind, &table_name, &col_refs);
         let batch_size: usize = task.batch_size.max(1).min(10_000) as usize;
+
+        // ── CSV backup (generic path — write each chunk as we go) ──
+        let mut first_chunk = true;
+        let backup_path: Option<String> = task.backup.as_ref().and_then(|b| {
+            if b.mode == BackupMode::File {
+                let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let safe_name = table_name.replace('.', "_");
+                Some(format!("{}/{}_{}.csv", b.dir, safe_name, ts))
+            } else {
+                None
+            }
+        });
+        if let Some(ref path) = backup_path {
+            let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create backup dir for: {}", path))?;
+        }
 
         loop {
             let raw_rows: Vec<AnyRow> = if use_keyset {
@@ -425,6 +465,12 @@ async fn sync_one_table(
                 raw_rows.iter().map(row_to_map).collect();
             let processed = rule_engine.process_rows(&table_name, &rows);
 
+            // ── CSV backup — append this chunk ──
+            if let Some(ref path) = backup_path {
+                write_backup_csv(path, &col_names, &processed, first_chunk)?;
+                first_chunk = false;
+            }
+
             let mut tx = target_pool.begin().await
                 .with_context(|| format!("Failed to begin transaction for chunk (cursor={})", cursor))?;
             for batch in processed.chunks(batch_size) {
@@ -441,6 +487,20 @@ async fn sync_one_table(
                 "  Table '{}': chunk of {} rows written (total: {}, cursor: {})",
                 table_name, chunk_len, table_total, cursor,
             );
+        }
+
+        // ── Backup compress (generic path) ──
+        if let Some(ref backup) = task.backup {
+            if backup.mode == BackupMode::File && backup.compress {
+                if let Some(ref path) = backup_path {
+                    if table_total > 0 {
+                        gzip_file(path)?;
+                        tracing::info!("  Backup: {}.csv.gz saved", path);
+                    } else {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
         }
     }
 
@@ -682,6 +742,71 @@ where
     Ok(())
 }
 
+// ─── CSV Backup Helpers ────────────────────────────────────────────
+
+/// Write processed rows as CSV to `file_path`.
+///
+/// If `first_chunk` is true, the file is created fresh with a header row.
+/// Otherwise, rows are appended to the existing file.
+fn write_backup_csv(
+    file_path: &str,
+    col_names: &[String],
+    rows: &[HashMap<String, Option<String>>],
+    first_chunk: bool,
+) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(!first_chunk)
+        .write(true)
+        .open(file_path)
+        .with_context(|| format!("Failed to open backup CSV: {}", file_path))?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    // Write header on first chunk
+    if first_chunk {
+        for (i, col) in col_names.iter().enumerate() {
+            if i > 0 {
+                writer.write_all(b",")?;
+            }
+            csv_write_value(&mut writer, col)?;
+        }
+        writer.write_all(b"\n")?;
+    }
+
+    // Write data rows
+    for row in rows {
+        for (i, col) in col_names.iter().enumerate() {
+            if i > 0 {
+                writer.write_all(b",")?;
+            }
+            let val = row.get(col).and_then(|v| v.as_deref()).unwrap_or("");
+            csv_write_value(&mut writer, val)?;
+        }
+        writer.write_all(b"\n")?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Gzip-compress a file in-place. Removes the original.
+fn gzip_file(path: &str) -> Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let gz_path = format!("{}.gz", path);
+    let mut src = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open {} for gzip", path))?;
+    let dst = std::fs::File::create(&gz_path)
+        .with_context(|| format!("Failed to create {}", gz_path))?;
+    let mut encoder = GzEncoder::new(dst, Compression::default());
+    std::io::copy(&mut src, &mut encoder)
+        .with_context(|| format!("Failed to gzip {}", path))?;
+    encoder.finish()?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 /// Parse a single CSV line into fields, handling standard CSV quoting.
 ///
 /// Supports: quoted fields with `""` escapes, unquoted fields, and MySQL's
@@ -722,32 +847,31 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-/// Write a single CSV field value to the buffer, escaping as needed.
-fn csv_write_value(buf: &mut Vec<u8>, value: &str) {
+/// Write a single CSV field value to the writer, escaping as needed.
+///
+/// For empty/NULL values, writes `\N` (MySQL-compatible NULL marker).
+fn csv_write_value(buf: &mut impl Write, value: &str) -> std::io::Result<()> {
     if value.is_empty() {
-        buf.extend_from_slice(b"\\N");
-        return;
+        return buf.write_all(b"\\N");
     }
 
-    // Check if escaping is needed
     let needs_quoting = value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\\');
     if needs_quoting {
-        buf.push(b'"');
+        buf.write_all(b"\"")?;
         for ch in value.chars() {
             if ch == '"' {
-                buf.extend_from_slice(b"\"\"");
+                buf.write_all(b"\"\"")?;
             } else {
-                buf.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes());
+                let mut tmp = [0u8; 4];
+                let encoded = ch.encode_utf8(&mut tmp);
+                buf.write_all(encoded.as_bytes())?;
             }
         }
-        buf.push(b'"');
+        buf.write_all(b"\"")
     } else {
-        buf.extend_from_slice(value.as_bytes());
+        buf.write_all(value.as_bytes())
     }
 }
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
