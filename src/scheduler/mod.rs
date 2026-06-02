@@ -322,13 +322,19 @@ struct HealthResponse {
     status: String,
     version: String,
     uptime: f64,
+    tasks: usize,
+    scheduled: usize,
 }
 
-async fn health_handler(State(_state): State<Arc<ApiState>>) -> Json<HealthResponse> {
+async fn health_handler(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
+    let tasks = state.config.tasks.len();
+    let scheduled = state.config.tasks.iter().filter(|t| t.schedule.is_some()).count();
     Json(HealthResponse {
         status: "ok".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         uptime: 0.0,
+        tasks,
+        scheduled,
     })
 }
 
@@ -338,24 +344,50 @@ struct TaskSummary {
     source: String,
     target: String,
     schedule: Option<String>,
-    tables: Vec<String>,
+    tables: Vec<TableSummary>,
+    last_run: Option<String>,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct TableSummary {
+    name: String,
+    mode: String,
 }
 
 async fn list_tasks_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Json<Vec<TaskSummary>> {
-    let tasks: Vec<TaskSummary> = state
-        .config
-        .tasks
-        .iter()
-        .map(|t| TaskSummary {
+    let mut tasks: Vec<TaskSummary> = Vec::with_capacity(state.config.tasks.len());
+
+    for t in &state.config.tasks {
+        // Query store for the latest run
+        let (last_run, status) = if let Some(ref store) = state.store {
+            match store.get_latest_run(&t.name).await {
+                Ok(Some(record)) => (Some(record.started_at), record.status),
+                _ => (None, "never".into()),
+            }
+        } else {
+            (None, "unknown".into())
+        };
+
+        tasks.push(TaskSummary {
             name: t.name.clone(),
             source: t.source.clone(),
             target: t.target.clone(),
             schedule: t.schedule.clone(),
-            tables: t.tables.iter().map(|tbl| tbl.name.clone()).collect(),
-        })
-        .collect();
+            tables: t.tables.iter().map(|tbl| TableSummary {
+                name: tbl.name.clone(),
+                mode: match tbl.mode {
+                    crate::config::types::TableMode::Ignore => "ignore".into(),
+                    crate::config::types::TableMode::Sync => "sync".into(),
+                },
+            }).collect(),
+            last_run,
+            status,
+        });
+    }
+
     Json(tasks)
 }
 

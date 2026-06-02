@@ -213,6 +213,12 @@ impl Store {
         Ok(())
     }
 
+    /// Get the most recent run for a specific task.
+    pub async fn get_latest_run(&self, task_name: &str) -> Result<Option<RunRecord>> {
+        let mut records = self.get_run_history(task_name, 1).await?;
+        Ok(records.pop())
+    }
+
     /// Get run history for a specific task, most recent first.
     pub async fn get_run_history(&self, task_name: &str, limit: u64) -> Result<Vec<RunRecord>> {
         let records = sqlx::query_as::<_, (i64, String, String, String, Option<String>, i64, i64, Option<String>, f64)>(

@@ -5,6 +5,7 @@ mod logger;
 mod rule;
 mod scheduler;
 mod store;
+mod backup;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -54,6 +54,11 @@ crc32fast = "1"
 # Compression (CSV backup)
 flate2 = "1"
 
+# AWS S3 (CSV backup upload)
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls"] }
+aws-config = "1"
+bytes = "1"
+
 # Cron expression parsing
 cron = "0.14"
 

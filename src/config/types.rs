@@ -221,6 +221,9 @@ pub enum BackupMode {
     /// Save processed data as CSV file(s)
     #[serde(rename = "file")]
     File,
+    /// Upload to S3-compatible object storage
+    #[serde(rename = "s3")]
+    S3,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -236,6 +239,22 @@ pub struct BackupConfig {
     /// Whether to gzip backup files (default: true)
     #[serde(default = "default_bool_true")]
     pub compress: bool,
+
+    /// S3-compatible storage configuration (required when mode is "s3")
+    pub s3: Option<S3Config>,
+}
+
+/// Configuration for S3-compatible object storage backup.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct S3Config {
+    /// S3 bucket name
+    pub bucket: String,
+    /// AWS region (e.g. "us-east-1")
+    pub region: String,
+    /// Custom endpoint URL (optional, for MinIO/COS/S3-compatible services)
+    pub endpoint: Option<String>,
+    /// Key prefix (path) within the bucket
+    pub key_prefix: Option<String>,
 }
 
 fn default_backup_dir() -> String {

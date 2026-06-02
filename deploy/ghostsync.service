@@ -1,0 +1,30 @@
+[Unit]
+Description=GhostSync - Lightweight Data Sync & Desensitization Proxy
+Documentation=https://github.com/ghostSync/ghostSync
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghostsync
+Group=ghostsync
+ExecStart=/usr/local/bin/ghostsync serve /etc/ghostsync/config.yaml --port 9710
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ghostsync /var/log/ghostsync
+ProtectHome=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+
+# Environment variables (sensitive credentials)
+EnvironmentFile=-/etc/ghostsync/env
+
+[Install]
+WantedBy=multi-user.target

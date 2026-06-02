@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  ghostsync:
+    image: ghostsync:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ghostsync
+    restart: unless-stopped
+    ports:
+      - "9710:9710"
+    volumes:
+      - ./config.yaml:/etc/ghostsync/config.yaml:ro
+      - ghostsync-data:/var/lib/ghostsync
+      - ghostsync-backups:/var/backups/ghostsync
+    environment:
+      - RUST_LOG=info
+      - GHOSTSYNC_CONFIG=/etc/ghostsync/config.yaml
+      # Database credentials (override for production)
+      - PG_PASS=${PG_PASS:-}
+      - MYSQL_PASS=${MYSQL_PASS:-}
+      - STAGING_PASS=${STAGING_PASS:-}
+      # AWS credentials (for S3 backup)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    command: ["serve", "/etc/ghostsync/config.yaml", "--port", "9710"]
+
+volumes:
+  ghostsync-data:
+  ghostsync-backups:

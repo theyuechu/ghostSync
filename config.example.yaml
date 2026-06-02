@@ -87,6 +87,20 @@ tasks:
     # If true, truncate target table before inserting
     truncate_target: true
 
+    # ── Backup configuration (optional) ──────────────────────────
+    # backup:
+    #   mode: file            # "none" | "file" | "s3"
+    #   dir: ./backups        # Local backup directory
+    #   compress: true        # Gzip the CSV files
+    #
+    #   # For S3 backup (requires env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    #   # mode: s3
+    #   # s3:
+    #   #   bucket: ghostsync-backups
+    #   #   region: us-east-1
+    #   #   endpoint: https://<account>.r2.cloudflarestorage.com   # For R2/MinIO
+    #   #   key_prefix: prod/daily                                 # Optional path prefix
+
   # ── Task 2: MySQL product sync ─────────────────────────────────────
   - name: nightly-sync-products
     source: prod-mysql

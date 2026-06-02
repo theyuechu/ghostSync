@@ -120,6 +120,20 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
+    // 7. Validate backup configuration
+    for task in &config.tasks {
+        if let Some(ref backup) = task.backup {
+            if backup.mode == crate::config::types::BackupMode::S3 {
+                if backup.s3.is_none() {
+                    bail!(
+                        "Task '{}': backup mode is 's3' but no 's3' configuration block provided",
+                        task.name
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

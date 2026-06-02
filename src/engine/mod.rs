@@ -16,6 +16,7 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing;
 
+use crate::backup;
 use crate::config::types::{
     BackupMode, ConnectionConfig, DbKind, TableConfig, TableMode, TaskConfig,
 };
@@ -367,7 +368,7 @@ async fn sync_one_table(
 
         // ── CSV file backup (MySQL same-server path) ──
         if let Some(backup) = &task.backup {
-            if backup.mode == BackupMode::File && rows_synced > 0 {
+            if backup.mode != BackupMode::None && rows_synced > 0 {
                 std::fs::create_dir_all(&backup.dir)
                     .with_context(|| format!("Failed to create backup dir: {}", backup.dir))?;
                 let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -378,8 +379,11 @@ async fn sync_one_table(
 
                 if backup.compress {
                     gzip_file(&backup_path)?;
+                    let gz_path = format!("{}.gz", backup_path);
+                    backup::handle_backup(&gz_path, rows_synced, task, &table_name).await?;
                     tracing::info!("  Backup: {}.csv.gz saved ({})", backup_path, rows_synced);
                 } else {
+                    backup::handle_backup(&backup_path, rows_synced, task, &table_name).await?;
                     tracing::info!("  Backup: {}.csv saved ({})", backup_path, rows_synced);
                 }
             }
@@ -395,15 +399,18 @@ async fn sync_one_table(
 
         // ── CSV backup (generic path — write each chunk as we go) ──
         let mut first_chunk = true;
-        let backup_path: Option<String> = task.backup.as_ref().and_then(|b| {
-            if b.mode == BackupMode::File {
+        let needs_backup = task.backup.as_ref().map_or(false, |b| b.mode != BackupMode::None);
+        let backup_path: Option<String> = if needs_backup {
+            if let Some(b) = &task.backup {
                 let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
                 let safe_name = table_name.replace('.', "_");
                 Some(format!("{}/{}_{}.csv", b.dir, safe_name, ts))
             } else {
                 None
             }
-        });
+        } else {
+            None
+        };
         if let Some(ref path) = backup_path {
             let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
             std::fs::create_dir_all(dir)
@@ -489,13 +496,20 @@ async fn sync_one_table(
             );
         }
 
-        // ── Backup compress (generic path) ──
+        // ── Backup compress + S3 upload (generic path) ──
         if let Some(ref backup) = task.backup {
-            if backup.mode == BackupMode::File && backup.compress {
+            if backup.mode != BackupMode::None {
                 if let Some(ref path) = backup_path {
                     if table_total > 0 {
-                        gzip_file(path)?;
-                        tracing::info!("  Backup: {}.csv.gz saved", path);
+                        if backup.compress {
+                            gzip_file(path)?;
+                            let gz_path = format!("{}.gz", path);
+                            backup::handle_backup(&gz_path, table_total, task, &table_name).await?;
+                            tracing::info!("  Backup: {}.csv.gz saved", gz_path);
+                        } else {
+                            backup::handle_backup(path, table_total, task, &table_name).await?;
+                            tracing::info!("  Backup: {}.csv saved", path);
+                        }
                     } else {
                         let _ = std::fs::remove_file(path);
                     }

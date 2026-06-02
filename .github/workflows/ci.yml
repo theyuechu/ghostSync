@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [ "master", "develop" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: source_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run unit tests
+        run: cargo test --lib
+        env:
+          DATABASE_URL_MYSQL: mysql://root:root@127.0.0.1:3306/source_db
+          DATABASE_URL_PG: postgres://postgres:postgres@127.0.0.1:5432/test_db
+
+      - name: Run integration tests
+        run: cargo test --test integration
+        env:
+          DATABASE_URL_MYSQL: mysql://root:root@127.0.0.1:3306/source_db
+          DATABASE_URL_PG: postgres://postgres:postgres@127.0.0.1:5432/test_db
+
+      - name: Binary size check
+        run: |
+          BIN_SIZE=$(stat --format=%s target/release/ghostsync)
+          echo "Binary size: $((BIN_SIZE / 1024 / 1024)) MB"
+          echo "size=$((BIN_SIZE / 1024 / 1024))" >> $GITHUB_OUTPUT
+
+  docker-build:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ghostsync:latest
