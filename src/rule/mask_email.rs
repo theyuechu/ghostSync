@@ -21,10 +21,6 @@ impl Default for MaskEmailRule {
 }
 
 impl Rule for MaskEmailRule {
-    fn name(&self) -> &'static str {
-        "mask_email"
-    }
-
     fn apply(&self, value: Option<&str>) -> RuleResult {
         let s = match value {
             Some(v) if !v.is_empty() => v,

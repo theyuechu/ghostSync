@@ -76,38 +76,6 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    /// Resolve the connection URL.
-    ///
-    /// If `url` is already set, use it as-is (env vars should already be expanded).
-    /// Otherwise, construct a URL from the individual fields.
-    pub fn resolve(&mut self) -> anyhow::Result<()> {
-        if self.url.is_some() {
-            return Ok(());
-        }
-
-        let kind = "postgres"; // will be overridden by caller with correct kind
-        let host = self.host.as_deref().unwrap_or("localhost");
-        let port = self.port.map(|p| p.to_string()).unwrap_or_else(|| "5432".to_string());
-        let db = self.database.as_deref().unwrap_or("postgres");
-        let user = self.user.as_deref().unwrap_or("postgres");
-        let pass = self.password.as_deref().unwrap_or("");
-
-        let constructed = if pass.is_empty() {
-            format!("{}://{}@{}:{}/{}", kind, user, host, port, db)
-        } else {
-            format!("{}://{}:{}@{}:{}/{}", kind, user, pass, host, port, db)
-        };
-
-        // Append ssl_mode if set
-        let constructed = match &self.ssl_mode {
-            Some(mode) if !mode.is_empty() => format!("{}?sslmode={}", constructed, mode),
-            _ => constructed,
-        };
-
-        self.url = Some(constructed);
-        Ok(())
-    }
-
     /// Resolve with a known DB kind (constructs the correct URL scheme).
     pub fn resolve_with_kind(&mut self, kind: &DbKind) -> anyhow::Result<()> {
         if self.url.is_some() {

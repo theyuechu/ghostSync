@@ -7,10 +7,6 @@ use super::{Rule, RuleResult};
 pub struct IgnoreFieldRule;
 
 impl Rule for IgnoreFieldRule {
-    fn name(&self) -> &'static str {
-        "ignore"
-    }
-
     fn apply(&self, _value: Option<&str>) -> RuleResult {
         RuleResult::Skip
     }

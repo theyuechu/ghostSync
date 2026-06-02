@@ -61,15 +61,6 @@ pub async fn test_single_connection(kind: &DbKind, conn: &ConnectionConfig) -> R
     Ok(row.0)
 }
 
-/// Test connectivity: open a connection and run a simple health query.
-pub async fn test_connection(pool: &AnyPool) -> Result<String> {
-    let row: (String,) = sqlx::query_as::<_, (String,)>("SELECT version()")
-        .fetch_one(pool)
-        .await
-        .context("Failed to execute health check query")?;
-    Ok(row.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,7 +71,7 @@ mod tests {
             url: Some("postgres://user:pass@localhost:5432/mydb".into()),
             ..Default::default()
         };
-        assert!(conn.resolve().is_ok());
+        assert!(conn.resolve_with_kind(&DbKind::Postgres).is_ok());
         assert_eq!(
             conn.url.as_deref().unwrap(),
             "postgres://user:pass@localhost:5432/mydb"

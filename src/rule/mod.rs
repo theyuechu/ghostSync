@@ -4,7 +4,7 @@
 /// - `Rule` trait — each transformation is a struct implementing this trait.
 /// - `RuleEngine` — holds per-table per-field rules, processes rows.
 /// - Concrete rules: MaskPhone, MaskEmail, Hash, Ignore.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 pub(crate) mod hash;
@@ -27,18 +27,6 @@ pub enum RuleResult {
     PassThrough,
 }
 
-impl RuleResult {
-    /// Resolve into an `Option<String>` suitable for the output row.
-    /// `original` is the value before any rule was applied.
-    pub fn into_option(self, original: Option<String>) -> Option<String> {
-        match self {
-            RuleResult::Skip => None,
-            RuleResult::Replace(v) => Some(v),
-            RuleResult::PassThrough => original,
-        }
-    }
-}
-
 // ─── Rule Trait ─────────────────────────────────────────────────────
 
 /// A single field-level transformation rule.
@@ -46,9 +34,6 @@ impl RuleResult {
 /// Implementations must be stateless (or contain only immutable config).
 /// They are shared across worker threads via `&Box<dyn Rule>`.
 pub trait Rule: Send + Sync + fmt::Debug {
-    /// Human-readable rule type name (e.g. "mask_phone", "hash")
-    fn name(&self) -> &'static str;
-
     /// Apply the rule to an optional string value.
     ///
     /// - If `value` is `None` (SQL NULL), most rules return `PassThrough`.
@@ -63,25 +48,17 @@ pub trait Rule: Send + Sync + fmt::Debug {
 /// Thread-safe: contains only `&dyn Rule` references and static config.
 #[derive(Debug)]
 pub struct RuleEngine {
-    /// Table names that should be entirely skipped
-    ignored_tables: HashSet<String>,
     /// Per-table field rules: table_name -> [(field_name, rule)]
     field_rules: HashMap<String, Vec<(String, Box<dyn Rule>)>>,
-    /// Whether to truncate target before sync
-    pub truncate_target: bool,
 }
 
 impl RuleEngine {
     /// Build a `RuleEngine` from a task's table configurations.
     pub fn from_task(task: &TaskConfig) -> Self {
-        let mut ignored_tables = HashSet::new();
         let mut field_rules: HashMap<String, Vec<(String, Box<dyn Rule>)>> = HashMap::new();
 
         for table_cfg in &task.tables {
-            let table_name = table_cfg.name.clone();
-
             if table_cfg.mode == TableMode::Ignore {
-                ignored_tables.insert(table_name);
                 continue;
             }
 
@@ -95,20 +72,11 @@ impl RuleEngine {
             }
 
             if !rules.is_empty() {
-                field_rules.insert(table_name, rules);
+                field_rules.insert(table_cfg.name.clone(), rules);
             }
         }
 
-        RuleEngine {
-            ignored_tables,
-            field_rules,
-            truncate_target: task.truncate_target,
-        }
-    }
-
-    /// Check if this entire table should be skipped.
-    pub fn is_table_ignored(&self, table: &str) -> bool {
-        self.ignored_tables.contains(table)
+        RuleEngine { field_rules }
     }
 
     /// Return the field rules for a table, if any.
@@ -285,13 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ignore_table() {
-        let engine = RuleEngine::from_task(&make_task());
-        assert!(engine.is_table_ignored("internal_logs"));
-        assert!(!engine.is_table_ignored("users"));
-    }
-
-    #[test]
     fn test_mask_phone_rule() {
         let engine = RuleEngine::from_task(&make_task());
         let mut row = HashMap::new();
@@ -374,17 +335,6 @@ mod tests {
             result.get("id").and_then(|v| v.as_deref()).unwrap(),
             "42"
         );
-    }
-
-    #[test]
-    fn test_rule_result_into_option() {
-        let orig = Some("hello".to_string());
-        assert_eq!(RuleResult::Skip.into_option(orig.clone()), None);
-        assert_eq!(
-            RuleResult::Replace("world".into()).into_option(orig.clone()),
-            Some("world".to_string())
-        );
-        assert_eq!(RuleResult::PassThrough.into_option(orig.clone()), orig);
     }
 
     #[test]

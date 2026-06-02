@@ -22,10 +22,6 @@ impl Default for MaskPhoneRule {
 }
 
 impl Rule for MaskPhoneRule {
-    fn name(&self) -> &'static str {
-        "mask_phone"
-    }
-
     fn apply(&self, value: Option<&str>) -> RuleResult {
         let s = match value {
             Some(v) if !v.is_empty() => v,

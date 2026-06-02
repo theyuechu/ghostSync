@@ -8,13 +8,11 @@ use crate::config::types::DbKind;
 #[derive(Debug, Clone)]
 pub struct ColumnInfo {
     pub name: String,
-    pub data_type: String,
 }
 
 /// Table schema: primary key + columns
 #[derive(Debug, Clone)]
 pub struct TableSchema {
-    pub name: String,
     pub columns: Vec<ColumnInfo>,
     pub primary_keys: Vec<String>,
 }
@@ -25,7 +23,6 @@ pub async fn introspect_table(pool: &AnyPool, table: &str, kind: &DbKind) -> Res
     let primary_keys = list_primary_keys(pool, table).await?;
 
     Ok(TableSchema {
-        name: table.to_string(),
         columns,
         primary_keys,
     })
@@ -42,10 +39,10 @@ pub async fn list_columns(pool: &AnyPool, table: &str, kind: &DbKind) -> Result<
     };
 
     let query = format!(
-        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?{schema_filter} ORDER BY ordinal_position"
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?{schema_filter} ORDER BY ordinal_position"
     );
 
-    let rows = sqlx::query_as::<_, (String, String)>(&query)
+    let rows = sqlx::query_as::<_, (String,)>(&query)
         .bind(table_name)
         .fetch_all(pool)
         .await
@@ -53,7 +50,7 @@ pub async fn list_columns(pool: &AnyPool, table: &str, kind: &DbKind) -> Result<
 
     let columns = rows
         .into_iter()
-        .map(|(name, data_type)| ColumnInfo { name, data_type })
+        .map(|(name,)| ColumnInfo { name })
         .collect();
 
     Ok(columns)

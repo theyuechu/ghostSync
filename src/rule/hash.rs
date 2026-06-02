@@ -15,10 +15,6 @@ pub struct HashRule {
 }
 
 impl Rule for HashRule {
-    fn name(&self) -> &'static str {
-        "hash"
-    }
-
     fn apply(&self, value: Option<&str>) -> RuleResult {
         let s = match value {
             Some(v) => v,

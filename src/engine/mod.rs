@@ -682,23 +682,6 @@ where
     Ok(())
 }
 
-fn get_value_from_row(row: &AnyRow, idx: usize) -> Option<String> {
-    row.try_get::<Option<String>, _>(idx)
-        .or_else(|_| {
-            row.try_get::<Option<i64>, _>(idx)
-                .map(|v| v.map(|n| n.to_string()))
-        })
-        .or_else(|_| {
-            row.try_get::<Option<f64>, _>(idx)
-                .map(|v| v.map(|n| n.to_string()))
-        })
-        .or_else(|_| {
-            row.try_get::<Option<bool>, _>(idx)
-                .map(|v| v.map(|b| b.to_string()))
-        })
-        .unwrap_or(None)
-}
-
 /// Parse a single CSV line into fields, handling standard CSV quoting.
 ///
 /// Supports: quoted fields with `""` escapes, unquoted fields, and MySQL's

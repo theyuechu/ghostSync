@@ -142,20 +142,6 @@ impl Store {
         Ok(row)
     }
 
-    /// Delete the cursor for a (task, table) pair (e.g. after a full resync).
-    pub async fn delete_cursor(&self, task_name: &str, table_name: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            DELETE FROM sync_cursors WHERE task_name = ? AND table_name = ?
-            "#,
-        )
-        .bind(task_name)
-        .bind(table_name)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Record the start of a task run. Returns the new run_id.
     pub async fn log_run_start(&self, task_name: &str) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
@@ -263,37 +249,4 @@ impl Store {
             .collect())
     }
 
-    /// Get run history for all tasks, most recent first.
-    pub async fn get_all_runs(&self, limit: u64) -> Result<Vec<RunRecord>> {
-        let records = sqlx::query_as::<_, (i64, String, String, String, Option<String>, i64, i64, Option<String>, f64)>(
-            r#"
-            SELECT id, task_name, status, started_at, finished_at,
-                   processed_rows, total_rows, error_message, rps
-            FROM task_runs
-            ORDER BY started_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to query all run history")?;
-
-        Ok(records
-            .into_iter()
-            .map(|(id, task_name, status, started_at, finished_at, processed_rows, total_rows, error_message, rps)| {
-                RunRecord {
-                    id,
-                    task_name,
-                    status,
-                    started_at,
-                    finished_at,
-                    processed_rows,
-                    total_rows,
-                    error_message,
-                    rps,
-                }
-            })
-            .collect())
-    }
 }
