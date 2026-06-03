@@ -5,8 +5,9 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use std::str::FromStr;
 
 /// A single task execution record.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -30,9 +31,16 @@ pub struct Store {
 impl Store {
     /// Open or create the SQLite database and run migrations.
     pub async fn open(path: &str) -> Result<Self> {
+        let url = if path.starts_with("sqlite:") {
+            path.to_string()
+        } else {
+            format!("sqlite:{}?mode=rwc", path)
+        };
+        let opts = SqliteConnectOptions::from_str(&url)
+            .with_context(|| format!("Failed to parse SQLite URL from: {}", url))?;
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
-            .connect(path)
+            .connect_with(opts)
             .await
             .with_context(|| format!("Failed to open SQLite store at: {}", path))?;
 

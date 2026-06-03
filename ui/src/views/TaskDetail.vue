@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { fetchTaskLogs, triggerTask, fetchTasks } from '../api'
 import type { RunRecord, TaskSummary } from '../api'
@@ -12,6 +12,8 @@ const runs = ref<RunRecord[]>([])
 const loading = ref(true)
 const error = ref<string | null>(null)
 const running = ref(false)
+
+let pollTimer: ReturnType<typeof setInterval> | null = null
 
 async function load() {
   loading.value = true
@@ -27,13 +29,33 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // Auto-poll every 3s if any run is still running
+  checkAndPoll()
+}
+
+function checkAndPoll() {
+  const hasRunning = runs.value.some(r => r.status === 'running')
+  if (hasRunning && !pollTimer) {
+    pollTimer = setInterval(async () => {
+      try {
+        runs.value = await fetchTaskLogs(props.name)
+        // Stop polling when no runs are running
+        if (!runs.value.some(r => r.status === 'running')) {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+          // Also refresh task info to update latest run status
+          const tasks = await fetchTasks()
+          task.value = tasks.find((t) => t.name === props.name) || null
+        }
+      } catch (_) { /* silent */ }
+    }, 3000)
+  }
 }
 
 async function runNow() {
   running.value = true
   try {
     await triggerTask(props.name)
-    setTimeout(load, 1000)
+    setTimeout(load, 500)
   } catch (e: any) {
     alert(`Failed: ${e.message}`)
   } finally {
@@ -42,6 +64,7 @@ async function runNow() {
 }
 
 onMounted(load)
+onUnmounted(() => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } })
 </script>
 
 <template>
@@ -97,7 +120,7 @@ onMounted(load)
         <tbody>
           <tr v-for="run in runs" :key="run.id">
             <td>
-              <span class="badge" :class="run.status === 'success' ? 'badge-success' : 'badge-error'">
+              <span class="badge" :class="run.status === 'success' ? 'badge-success' : run.status === 'running' ? 'badge-pending' : 'badge-error'">
                 {{ run.status }}
               </span>
             </td>

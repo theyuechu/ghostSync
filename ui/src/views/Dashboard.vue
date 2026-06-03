@@ -90,7 +90,7 @@ onMounted(load)
         <tr v-if="task.last_run">
           <td class="text-dim text-sm">Last Run</td>
           <td>
-            <span class="badge" :class="task.status === 'success' ? 'badge-success' : 'badge-error'">
+            <span class="badge" :class="task.status === 'success' ? 'badge-success' : task.status === 'running' ? 'badge-pending' : 'badge-error'">
               {{ task.status }}
             </span>
             <span class="text-dim text-sm" style="margin-left: 0.5rem">{{ new Date(task.last_run).toLocaleString() }}</span>

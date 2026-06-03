@@ -291,8 +291,8 @@ async fn serve_api(
     let app = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/tasks", get(list_tasks_handler))
-        .route("/api/tasks/{name}/run", post(run_task_handler))
-        .route("/api/tasks/{name}/logs", get(task_logs_handler))
+        .route("/api/tasks/:name/run", post(run_task_handler))
+        .route("/api/tasks/:name/logs", get(task_logs_handler))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -413,22 +413,11 @@ async fn run_task_handler(
         }
     };
 
-    // Record start
-    let run_id = if let Some(s) = &state.store {
-        match s.log_run_start(&task.name).await {
-            Ok(id) => Some(id),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
     // Execute in background — spawn so HTTP can return immediately
+    // (execute_and_log_task handles run start/end recording internally)
     let cfg = state.config.clone();
     let store = state.store.clone();
 
-    // For simplicity, run synchronously and return result
-    // (a production version would spawn this and return 202 Accepted)
     tokio::spawn(async move {
         execute_and_log_task(&task, &cfg, &store).await;
     });
@@ -436,7 +425,7 @@ async fn run_task_handler(
     Json(RunResponse {
         message: format!("Task '{}' triggered", name),
         task: name,
-        run_id,
+        run_id: None,
     })
 }
 
